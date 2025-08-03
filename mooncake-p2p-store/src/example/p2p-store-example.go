@@ -19,12 +19,15 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
+	"strconv"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/kvcache-ai/Mooncake/mooncake-p2p-store/src/p2pstore"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 var (
@@ -36,6 +39,73 @@ var (
 	fileSize              int
 	fileSizeMB            int
 )
+
+func getNextServerID(cli *clientv3.Client, seq string) (int, error) {
+	resp, err := cli.Get(context.Background(), seq)
+	if err != nil {
+		return -1, err
+	}
+
+	if len(resp.Kvs) == 0 {
+		txnResp, err := cli.Txn(context.Background()).
+			If(clientv3.Compare(clientv3.Version(seq), "=", 0)). // 检查key不存在
+			Then(clientv3.OpPut(seq, strconv.Itoa(0))).          // 初始化值为0
+			Commit()
+
+		if err != nil {
+			return -1, err
+		}
+
+		if txnResp.Succeeded {
+			return 0, nil
+		}
+
+		// 如果事务失败，说明key已经被其他客户端创建，重新获取值
+		resp, err = cli.Get(context.Background(), seq)
+		if err != nil {
+			return -1, err
+		}
+		if len(resp.Kvs) == 0 {
+			return -1, fmt.Errorf("failed to initialize server ID")
+		}
+	}
+
+	currentSeq, err := strconv.Atoi(string(resp.Kvs[0].Value))
+	newSeq := currentSeq + 1
+	if err != nil {
+		return -1, fmt.Errorf("failed to parse server ID")
+	}
+	txnResp, err := cli.Txn(context.Background()).
+		If(clientv3.Compare(clientv3.Value(seq), "=", strconv.Itoa(currentSeq))).
+		Then(clientv3.OpPut(seq, strconv.Itoa(newSeq))).
+		Commit()
+	if err != nil {
+		return -1, err
+	}
+	if !txnResp.Succeeded {
+		return -1, fmt.Errorf("failed to increment server ID")
+	}
+	return newSeq, nil
+}
+
+func getID(etcdServer string, seq string) int {
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{etcdServer},
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect etcd: %v\n", err)
+		return -1
+	}
+	defer cli.Close()
+
+	serverID, err := getNextServerID(cli, seq)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get next server ID: %v\n", err)
+		return -1
+	}
+	return serverID
+}
 
 func main() {
 	flag.StringVar(&command, "cmd", "trainer", "Command: trainer|inferencer")
@@ -56,6 +126,11 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	id := getID("10.32.5.251:2379", "/agents/seq")
+	fmt.Printf("(whorwe)main: 0 | id: %d", id)
+	http.HandleFunc("/", GetReq)
+	fmt.Println("(whorwe)main: 1 | Server running on :8080")
+	http.ListenAndServe(":8080", nil)
 
 	switch command {
 	case "trainer":

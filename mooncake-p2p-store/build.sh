@@ -56,7 +56,7 @@ if [ "$USE_HTTP" = "ON" ]; then
 fi
 
 go get
-go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go"
+go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go" "../example/server.go"
 if [ $? -ne 0 ]; then
     echo "Error: Failed to build the example."
     exit 1
