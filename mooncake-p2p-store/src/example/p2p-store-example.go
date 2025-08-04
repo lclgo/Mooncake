@@ -40,6 +40,8 @@ var (
 	fileSizeMB            int
 )
 
+var agentID int
+
 func getNextServerID(cli *clientv3.Client, seq string) (int, error) {
 	resp, err := cli.Get(context.Background(), seq)
 	if err != nil {
@@ -126,11 +128,22 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	id := getID("10.32.5.251:2379", "/agents/seq")
-	fmt.Printf("(whorwe)main: 0 | id: %d", id)
-	http.HandleFunc("/", GetReq)
-	fmt.Println("(whorwe)main: 1 | Server running on :8080")
-	http.ListenAndServe(":8080", nil)
+
+	agentID := getID(metadataServer, "/agents/seq")
+	if agentID < 0 {
+		fmt.Fprintf(os.Stderr, "agent ID is invalid\n")
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "Agent ID: %d\n", agentID)
+	agentServer := NewAgentServer()
+	agentServer.agentID = agentID
+	agentServer.metaServer = metadataServer
+	agentServer.localServer = localServerName
+	agentServer.device = deviceName
+	agentServer.nicPriorityMatrixPath = nicPriorityMatrixPath
+	http.HandleFunc("/", agentServer.ServeReq)
+	http.ListenAndServe(":8082", nil)
 
 	switch command {
 	case "trainer":

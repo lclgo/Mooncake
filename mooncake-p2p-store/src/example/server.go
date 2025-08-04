@@ -1,9 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/kvcache-ai/Mooncake/mooncake-p2p-store/src/p2pstore"
 )
 
 type RequestPayload struct {
@@ -11,7 +19,144 @@ type RequestPayload struct {
 	FileName string `json:"filename"`
 }
 
-func GetReq(w http.ResponseWriter, r *http.Request) {
+type AgentServer struct {
+	agentID               int
+	metaServer            string
+	localServer           string
+	device                string
+	nicPriorityMatrixPath string
+}
+
+func NewAgentServer() *AgentServer {
+	return &AgentServer{}
+}
+
+// length = 0: 从offset开始映射整个文件
+func mmapFileSection(path string, offset int64, length *int64) ([]byte, error) {
+	if offset < 0 || *length < 0 {
+		return nil, fmt.Errorf("offset/length must be non-negative")
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open file failed: %v\n", err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat file failed: %v\n", err)
+	}
+	fileSize := fi.Size()
+
+	if offset >= fileSize {
+		return nil, fmt.Errorf("offset is larger than file size")
+	}
+
+	if *length <= 0 {
+		*length = fileSize - offset
+	} else if *length > fileSize-offset {
+		return nil, fmt.Errorf("length is invalid")
+	}
+
+	addr, err := syscall.Mmap(int(f.Fd()), offset, int(*length), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED) //, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	if err != nil {
+		return nil, fmt.Errorf("mmap file failed: %v\n", err)
+	}
+	fmt.Printf("mmap file success: addr %x size %d\n", uintptr(unsafe.Pointer(&addr[0])), length)
+	return addr, nil
+}
+
+func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
+	store, err := p2pstore.NewP2PStore(a.metaServer, a.localServer, getPriorityMatrix())
+	if err != nil {
+		return fmt.Errorf("p2pstore initialization failed: %v\n", err)
+	}
+	var fileSize = int64(0)
+	addr, err := mmapFileSection(fileName, 0, &fileSize)
+	if err != nil {
+		return fmt.Errorf("mmap file failed: %v\n", err)
+	}
+
+	fmt.Printf("Object registration: name %s base address %x file size %d MB\n",
+		fileName,
+		uintptr(unsafe.Pointer(&addr[0])),
+		fileSize>>20)
+
+	startTimestamp := time.Now()
+	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
+	sizeList := []uint64{uint64(fileSize)}
+
+	const MAX_SHARD_SIZE uint64 = 64 * 1024 * 1024
+	const MEMORY_LOCATION string = "cpu:0"
+
+	err = store.Register(ctx, fileName, addrList, sizeList, MAX_SHARD_SIZE, MEMORY_LOCATION, true)
+	if err != nil {
+		return fmt.Errorf("registration failed: %v\n", err)
+	}
+
+	phaseOneTimestamp := time.Now()
+	duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
+
+	fmt.Printf("Object registration done: duration (ms) %d throughput (GB/s) %.2f\n",
+		duration,
+		float64(fileSize>>20)/float64(duration))
+
+	checkpointInfoList, err := store.List(ctx, "/root")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "List failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(checkpointInfoList)
+	return nil
+}
+
+func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
+	store, err := p2pstore.NewP2PStore(a.metaServer, a.localServer, getPriorityMatrix())
+	if err != nil {
+		return fmt.Errorf("p2pstore initialization failed: %v\n", err)
+	}
+
+	var fileSize = int64(2048 * 1024 * 1024)
+	addr, err := mmapFileSection(fileName, 0, &fileSize)
+	if err != nil {
+		return fmt.Errorf("mmap file failed: %v\n", err)
+	}
+
+	fmt.Println("Object retrieval started: name", fileName)
+	startTimestamp := time.Now()
+	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
+	sizeList := []uint64{uint64(fileSize)}
+	err = store.GetReplica(ctx, fileName, addrList, sizeList)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Object retrieval failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	phaseOneTimestamp := time.Now()
+	duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
+
+	fmt.Printf("Object retrieval done: duration (ms) %d throughput (GB/s) %.2f\n",
+		duration,
+		float64(fileSize>>20)/float64(duration))
+
+	err = store.DeleteReplica(ctx, fileName)
+	if err != nil {
+		return fmt.Errorf("DeleteReplica failed: %v\n")
+	}
+
+	if err := syscall.Munmap(addr); err != nil {
+		return fmt.Errorf("unmap failed: %v\n")
+	}
+	return nil
+}
+
+func (a *AgentServer) do_unregister(ctx context.Context, fileName string) error {
+	return nil
+}
+
+func (a *AgentServer) ServeReq(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -26,18 +171,24 @@ func GetReq(w http.ResponseWriter, r *http.Request) {
 
 	cmd := payload.Command
 	fileName := payload.FileName
-	log.Println("(whorwe)GetReq: 0 | fileName: ", fileName)
+	log.Println("(whorwe)GetReq: 0 | cmd: ", cmd, ", fileName: ", fileName)
 	switch cmd {
 	case "register":
-		log.Println("(whorwe)GetReq: 1 | register")
-		// register file
-		// store file
-		// return fileID
+		err := a.do_register(context.Background(), fileName)
+		if err != nil {
+			log.Println("register failed: ", err)
+		}
 	case "get":
-		log.Println("(whorwe)GetReq: 2 | get")
-		// get file
-		// return file
+		err := a.do_get(context.Background(), fileName)
+		if err != nil {
+			log.Println("get failed: ", err)
+		}
+	case "unregister":
+		err := a.do_unregister(context.Background(), fileName)
+		if err != nil {
+			log.Println("unregister failed: ", err)
+		}
 	default:
-		// error
+		log.Println("unknown command: ", cmd)
 	}
 }
