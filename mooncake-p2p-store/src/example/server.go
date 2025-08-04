@@ -25,6 +25,7 @@ type AgentServer struct {
 	localServer           string
 	device                string
 	nicPriorityMatrixPath string
+	p2pStore              *p2pstore.P2PStore
 }
 
 func NewAgentServer() *AgentServer {
@@ -68,10 +69,7 @@ func mmapFileSection(path string, offset int64, length *int64) ([]byte, error) {
 }
 
 func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
-	store, err := p2pstore.NewP2PStore(a.metaServer, a.localServer, getPriorityMatrix())
-	if err != nil {
-		return fmt.Errorf("p2pstore initialization failed: %v\n", err)
-	}
+	store := a.p2pStore
 	var fileSize = int64(0)
 	addr, err := mmapFileSection(fileName, 0, &fileSize)
 	if err != nil {
@@ -113,10 +111,7 @@ func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
 }
 
 func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
-	store, err := p2pstore.NewP2PStore(a.metaServer, a.localServer, getPriorityMatrix())
-	if err != nil {
-		return fmt.Errorf("p2pstore initialization failed: %v\n", err)
-	}
+	store := a.p2pStore
 
 	var fileSize = int64(2048 * 1024 * 1024)
 	addr, err := mmapFileSection(fileName, 0, &fileSize)
@@ -153,6 +148,12 @@ func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
 }
 
 func (a *AgentServer) do_unregister(ctx context.Context, fileName string) error {
+	store := a.p2pStore
+	err := store.Unregister(ctx, fileName)
+	if err != nil {
+		return fmt.Errorf("unregister failed: %v\n", err)
+	}
+	fmt.Println("Object unregistration done name: ", fileName)
 	return nil
 }
 

@@ -142,6 +142,12 @@ func main() {
 	agentServer.localServer = localServerName
 	agentServer.device = deviceName
 	agentServer.nicPriorityMatrixPath = nicPriorityMatrixPath
+	store, err := p2pstore.NewP2PStore(agentServer.metaServer, agentServer.localServer, getPriorityMatrix())
+	if err != nil {
+		fmt.Printf("Failed to init p2pstore: %v\n", err)
+		os.Exit(1)
+	}
+	agentServer.p2pStore = store
 	http.HandleFunc("/", agentServer.ServeReq)
 	http.ListenAndServe(":8082", nil)
 
