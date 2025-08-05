@@ -246,6 +246,17 @@ func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadIn
 	return result, nil
 }
 
+func (store *P2PStore) Get(ctx context.Context, name string) (*Payload, error) {
+	payload, _, err := store.metadata.Get(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if payload == nil {
+		return nil, ErrPayloadNotFound
+	}
+	return payload, nil
+}
+
 func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrList []uintptr, sizeList []uint64) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)

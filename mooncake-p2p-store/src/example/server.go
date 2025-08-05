@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 	"unsafe"
@@ -33,7 +34,7 @@ func NewAgentServer() *AgentServer {
 }
 
 // length = 0: 从offset开始映射整个文件
-func mmapFileSection(path string, offset int64, length *int64) ([]byte, error) {
+func mmapFileSection(path string, offset uint64, length *uint64) ([]byte, error) {
 	if offset < 0 || *length < 0 {
 		return nil, fmt.Errorf("offset/length must be non-negative")
 	}
@@ -48,19 +49,19 @@ func mmapFileSection(path string, offset int64, length *int64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stat file failed: %v\n", err)
 	}
-	fileSize := fi.Size()
+	fileSize := uint64(fi.Size())
 
 	if offset >= fileSize {
 		return nil, fmt.Errorf("offset is larger than file size")
 	}
 
-	if *length <= 0 {
+	if *length == 0 {
 		*length = fileSize - offset
 	} else if *length > fileSize-offset {
 		return nil, fmt.Errorf("length is invalid")
 	}
 
-	addr, err := syscall.Mmap(int(f.Fd()), offset, int(*length), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED) //, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	addr, err := syscall.Mmap(int(f.Fd()), int64(offset), int(*length), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED) //, syscall.MAP_ANON|syscall.MAP_PRIVATE)
 	if err != nil {
 		return nil, fmt.Errorf("mmap file failed: %v\n", err)
 	}
@@ -70,7 +71,7 @@ func mmapFileSection(path string, offset int64, length *int64) ([]byte, error) {
 
 func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
 	store := a.p2pStore
-	var fileSize = int64(0)
+	var fileSize uint64 = 0
 	addr, err := mmapFileSection(fileName, 0, &fileSize)
 	if err != nil {
 		return fmt.Errorf("mmap file failed: %v\n", err)
@@ -100,10 +101,9 @@ func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
 		duration,
 		float64(fileSize>>20)/float64(duration))
 
-	checkpointInfoList, err := store.List(ctx, "/root")
+	checkpointInfoList, err := store.List(ctx, "/")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "List failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("List failed: %v\n", err)
 	}
 
 	fmt.Println(checkpointInfoList)
@@ -112,8 +112,33 @@ func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
 
 func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
 	store := a.p2pStore
+	fileMeta, err := store.Get(ctx, fileName)
+	if err != nil {
+		return fmt.Errorf("get metadata failed: %v\n", err)
+	}
+	var fileSize = fileMeta.Size
 
-	var fileSize = int64(2048 * 1024 * 1024)
+	dirPath := filepath.Dir(fileName)
+	_, err = os.Stat(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("dir not exist: ", dirPath)
+		}
+		return fmt.Errorf("stat dir failed: %v\n", err)
+	}
+	_, err = os.Stat(fileName)
+	if err == nil {
+		fmt.Fprintf(os.Stderr, "file already exist: %s, will be overwritten", fileName)
+	}
+	f, err := os.Create(fileName)
+	if err != nil {
+		return fmt.Errorf("create file failed: %v\n", err)
+	}
+	if err := f.Truncate(int64(fileSize)); err != nil {
+		return fmt.Errorf("truncate file failed: %v\n", err)
+	}
+	defer f.Close()
+
 	addr, err := mmapFileSection(fileName, 0, &fileSize)
 	if err != nil {
 		return fmt.Errorf("mmap file failed: %v\n", err)
@@ -122,11 +147,10 @@ func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
 	fmt.Println("Object retrieval started: name", fileName)
 	startTimestamp := time.Now()
 	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
-	sizeList := []uint64{uint64(fileSize)}
+	sizeList := []uint64{fileSize}
 	err = store.GetReplica(ctx, fileName, addrList, sizeList)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Object retrieval failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("Object retrieval failed: %v\n", err)
 	}
 
 	phaseOneTimestamp := time.Now()
@@ -189,6 +213,13 @@ func (a *AgentServer) ServeReq(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Println("unregister failed: ", err)
 		}
+	case "list":
+		fileList, err := a.p2pStore.List(context.Background(), "/")
+		if err != nil {
+			log.Println("list failed: ", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(fileList)
 	default:
 		log.Println("unknown command: ", cmd)
 	}
