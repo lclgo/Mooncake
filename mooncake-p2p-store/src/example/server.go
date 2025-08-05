@@ -227,8 +227,13 @@ func (a *AgentServer) getFile(ctx context.Context, fileName string) error {
 		duration,
 		float64(fileSize>>20)/float64(duration))
 
-	// 这里必须要DeleteReplica，不然node1 register bar bar:0:2，node2 get bar, register bar:1:2
-	// 再node1 get bar:1:2会失败，原因未知。
+	// 这里不要DeleteReplica，不然node1 register bar，node2 get bar + register bar:1:2后
+	// node1 get bar:1:2会失败。
+	// 怀疑大致的原因是：DeleteReplica会将fileName映射的[addr, addr+fileSize)标记为无效，当我们执行
+	// Munmap(addr)后，马上再执行Mmap()映射同一个文件，内核分配的addr大概率是一致的，还是落在[addr, addr+fileSize)
+	// node1尝试获取node2注册的bar:1:2时，RDMA标记为无效的内存因为不可知的原因还未刷新，导致传输失败，重新get bar:1:2
+	// 就能成功了。
+	// 验证猜想：执行DeleteReplica后不Munmap()的情况下Mmap，get bar:1:2会成功。
 	// err = store.DeleteReplica(ctx, fileName)
 	// if err != nil {
 	// 	return fmt.Errorf("DeleteReplica failed: %v\n")
