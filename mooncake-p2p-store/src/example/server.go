@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -29,8 +30,29 @@ type AgentServer struct {
 	p2pStore              *p2pstore.P2PStore
 }
 
+type BlockInfo struct {
+	blockNum  int
+	blockSize uint64
+	fileSize  uint64
+	fileAddr  uintptr
+	fileName  string
+}
+
 func NewAgentServer() *AgentServer {
 	return &AgentServer{}
+}
+
+func NewBlockInfo(fileName string, fileSize uint64) *BlockInfo {
+	blockNum := 2
+	alignMB := uint64(1)<<uint64(20) - uint64(1)
+	blockSize := (fileSize/uint64(blockNum) + alignMB) & ^alignMB
+	return &BlockInfo{
+		blockNum:  blockNum,
+		blockSize: blockSize,
+		fileSize:  fileSize,
+		fileAddr:  0,
+		fileName:  fileName,
+	}
 }
 
 // length = 0: 从offset开始映射整个文件
@@ -65,31 +87,21 @@ func mmapFileSection(path string, offset uint64, length *uint64) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("mmap file failed: %v\n", err)
 	}
-	fmt.Printf("mmap file success: addr %x size %d\n", uintptr(unsafe.Pointer(&addr[0])), length)
+	fmt.Printf("mmap file success: addr %x size %d\n", uintptr(unsafe.Pointer(&addr[0])), *length)
 	return addr, nil
 }
 
-func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
-	store := a.p2pStore
-	var fileSize uint64 = 0
-	addr, err := mmapFileSection(fileName, 0, &fileSize)
-	if err != nil {
-		return fmt.Errorf("mmap file failed: %v\n", err)
-	}
-
+func do_register(ctx context.Context, store *p2pstore.P2PStore, fileName string, addrList []uintptr, sizeList []uint64) error {
 	fmt.Printf("Object registration: name %s base address %x file size %d MB\n",
 		fileName,
-		uintptr(unsafe.Pointer(&addr[0])),
-		fileSize>>20)
+		addrList[0],
+		sizeList[0]>>20)
 
 	startTimestamp := time.Now()
-	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
-	sizeList := []uint64{uint64(fileSize)}
-
 	const MAX_SHARD_SIZE uint64 = 64 * 1024 * 1024
 	const MEMORY_LOCATION string = "cpu:0"
 
-	err = store.Register(ctx, fileName, addrList, sizeList, MAX_SHARD_SIZE, MEMORY_LOCATION, true)
+	err := store.Register(ctx, fileName, addrList, sizeList, MAX_SHARD_SIZE, MEMORY_LOCATION, true)
 	if err != nil {
 		return fmt.Errorf("registration failed: %v\n", err)
 	}
@@ -99,7 +111,63 @@ func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
 
 	fmt.Printf("Object registration done: duration (ms) %d throughput (GB/s) %.2f\n",
 		duration,
-		float64(fileSize>>20)/float64(duration))
+		float64(sizeList[0]>>20)/float64(duration))
+
+	return nil
+}
+
+func (a *AgentServer) do_register_block(ctx context.Context, block *BlockInfo, id int) error {
+	if id >= block.blockNum {
+		return fmt.Errorf("block id is out of range")
+	}
+
+	offset := block.blockSize * uint64(id)
+	size := block.blockSize
+	if offset+size > block.fileSize {
+		size = block.fileSize - offset
+	}
+
+	var blockAddr uintptr
+	// if blockAddr == 0, means this file is not mapped
+	if block.fileAddr == 0 {
+		addr, err := mmapFileSection(block.fileName, offset, &size)
+		if err != nil {
+			return fmt.Errorf("mmap file failed: %v\n", err)
+		}
+		blockAddr = uintptr(unsafe.Pointer(&addr[0]))
+	} else {
+		blockAddr = block.fileAddr + uintptr(offset)
+	}
+
+	blockName := fmt.Sprintf("%s:%d:%d", block.fileName, id, block.blockNum)
+	addrList := []uintptr{blockAddr}
+	sizeList := []uint64{size}
+	return do_register(ctx, a.p2pStore, blockName, addrList, sizeList)
+}
+
+func (a *AgentServer) register(ctx context.Context, fileName string) error {
+	store := a.p2pStore
+	var fileSize uint64 = 0
+	addr, err := mmapFileSection(fileName, 0, &fileSize)
+	if err != nil {
+		return fmt.Errorf("mmap file failed: %v\n", err)
+	}
+
+	fileAddr := uintptr(unsafe.Pointer(&addr[0]))
+
+	if err := do_register(ctx, store, fileName,
+		[]uintptr{fileAddr},
+		[]uint64{fileSize}); err != nil {
+		return err
+	}
+
+	if !strings.Contains(fileName, ":") {
+		blockInfo := NewBlockInfo(fileName, fileSize)
+		blockInfo.fileAddr = fileAddr
+		if err := a.do_register_block(ctx, blockInfo, 0); err != nil {
+			return err
+		}
+	}
 
 	checkpointInfoList, err := store.List(ctx, "/")
 	if err != nil {
@@ -110,14 +178,13 @@ func (a *AgentServer) do_register(ctx context.Context, fileName string) error {
 	return nil
 }
 
-func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
+func (a *AgentServer) getFile(ctx context.Context, fileName string) error {
 	store := a.p2pStore
 	fileMeta, err := store.Get(ctx, fileName)
 	if err != nil {
 		return fmt.Errorf("get metadata failed: %v\n", err)
 	}
 	var fileSize = fileMeta.Size
-
 	dirPath := filepath.Dir(fileName)
 	_, err = os.Stat(dirPath)
 	if err != nil {
@@ -128,7 +195,7 @@ func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
 	}
 	_, err = os.Stat(fileName)
 	if err == nil {
-		fmt.Fprintf(os.Stderr, "file already exist: %s, will be overwritten", fileName)
+		fmt.Fprintf(os.Stderr, "file already exist: %s, will be overwritten\n", fileName)
 	}
 	f, err := os.Create(fileName)
 	if err != nil {
@@ -160,13 +227,24 @@ func (a *AgentServer) do_get(ctx context.Context, fileName string) error {
 		duration,
 		float64(fileSize>>20)/float64(duration))
 
-	err = store.DeleteReplica(ctx, fileName)
-	if err != nil {
-		return fmt.Errorf("DeleteReplica failed: %v\n")
-	}
+	// 这里必须要DeleteReplica，不然node1 register bar bar:0:2，node2 get bar, register bar:1:2
+	// 再node1 get bar:1:2会失败，原因未知。
+	// err = store.DeleteReplica(ctx, fileName)
+	// if err != nil {
+	// 	return fmt.Errorf("DeleteReplica failed: %v\n")
+	// }
 
 	if err := syscall.Munmap(addr); err != nil {
 		return fmt.Errorf("unmap failed: %v\n")
+	}
+
+	if strings.Contains(fileName, ":") {
+		return nil
+	}
+
+	blockInfo := NewBlockInfo(fileName, fileSize)
+	if err = a.do_register_block(ctx, blockInfo, 1); err != nil {
+		return fmt.Errorf("register block failed in getFile: %v\n", err)
 	}
 	return nil
 }
@@ -196,15 +274,15 @@ func (a *AgentServer) ServeReq(w http.ResponseWriter, r *http.Request) {
 
 	cmd := payload.Command
 	fileName := payload.FileName
-	log.Println("(whorwe)GetReq: 0 | cmd: ", cmd, ", fileName: ", fileName)
+	log.Println("(whorwe)GetReq: 0 | cmd:", cmd, ", fileName:", fileName)
 	switch cmd {
 	case "register":
-		err := a.do_register(context.Background(), fileName)
+		err := a.register(context.Background(), fileName)
 		if err != nil {
 			log.Println("register failed: ", err)
 		}
 	case "get":
-		err := a.do_get(context.Background(), fileName)
+		err := a.getFile(context.Background(), fileName)
 		if err != nil {
 			log.Println("get failed: ", err)
 		}
