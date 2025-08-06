@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -44,6 +45,8 @@ type MapInfo struct {
 
 var fileMappings = make(map[string]*MapInfo)
 
+const blockNum = 2
+
 func updateMap(registerName string, addrList []uintptr, sizeList []uint64) {
 	fileMappings[registerName] = &MapInfo{
 		addrList: addrList,
@@ -69,7 +72,6 @@ func NewAgentServer() *AgentServer {
 }
 
 func NewBlockInfo(fileName string, fileSize uint64) *BlockInfo {
-	blockNum := 2
 	alignMB := uint64(1)<<uint64(20) - uint64(1)
 	blockSize := (fileSize/uint64(blockNum) + alignMB) & ^alignMB
 	return &BlockInfo{
@@ -131,6 +133,7 @@ func do_register(ctx context.Context, store *p2pstore.P2PStore, fileName string,
 	if err != nil {
 		return fmt.Errorf("registration failed: %v", err)
 	}
+	updateMap(fileName, addrList, sizeList)
 
 	phaseOneTimestamp := time.Now()
 	duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
@@ -186,15 +189,14 @@ func (a *AgentServer) register(ctx context.Context, fileName string) error {
 		[]uint64{fileSize}); err != nil {
 		return err
 	}
-	updateMap(fileName, []uintptr{fileAddr}, []uint64{fileSize})
 
-	// if !strings.Contains(fileName, ":") {
-	// 	blockInfo := NewBlockInfo(fileName, fileSize)
-	// 	blockInfo.fileAddr = fileAddr
-	// 	if err := a.do_register_block(ctx, blockInfo, 0); err != nil {
-	// 		return err
-	// 	}
-	// }
+	if a.agentID == 0 && !strings.Contains(fileName, ":") {
+		blockInfo := NewBlockInfo(fileName, fileSize)
+		blockInfo.fileAddr = fileAddr
+		if err := a.do_register_block(ctx, blockInfo, a.agentID); err != nil {
+			return err
+		}
+	}
 
 	// checkpointInfoList, err := store.List(ctx, "/")
 	// if err != nil {
@@ -308,14 +310,13 @@ func (a *AgentServer) getFile(ctx context.Context, registerName string, localNam
 	// 	return fmt.Errorf("unmap failed: %v\n")
 	// }
 
-	// if strings.Contains(fileName, ":") {
-	// 	return nil
-	// }
-
-	// blockInfo := NewBlockInfo(fileName, fileSize)
-	// if err = a.do_register_block(ctx, blockInfo, 1); err != nil {
-	// 	return fmt.Errorf("register block failed in getFile: %v\n", err)
-	// }
+	if a.agentID != 0 && a.agentID < blockNum && !strings.Contains(registerName, ":") {
+		blockInfo := NewBlockInfo(registerName, fileSize)
+		blockInfo.fileAddr = uintptr(unsafe.Pointer(&addr[0]))
+		if err := a.do_register_block(ctx, blockInfo, a.agentID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
