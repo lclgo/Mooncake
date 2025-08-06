@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -17,8 +15,9 @@ import (
 )
 
 type RequestPayload struct {
-	Command  string `json:"command"`
-	FileName string `json:"filename"`
+	Command   string `json:"command"`
+	FileName  string `json:"filename"`
+	LocalName string `json:"localname"`
 }
 
 type AgentServer struct {
@@ -63,13 +62,13 @@ func mmapFileSection(path string, offset uint64, length *uint64) ([]byte, error)
 
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("open file failed: %v\n", err)
+		return nil, fmt.Errorf("open file failed: %v", err)
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat file failed: %v\n", err)
+		return nil, fmt.Errorf("stat file failed: %v", err)
 	}
 	fileSize := uint64(fi.Size())
 
@@ -83,9 +82,9 @@ func mmapFileSection(path string, offset uint64, length *uint64) ([]byte, error)
 		return nil, fmt.Errorf("length is invalid")
 	}
 
-	addr, err := syscall.Mmap(int(f.Fd()), int64(offset), int(*length), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED) //, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	addr, err := syscall.Mmap(int(f.Fd()), int64(offset), int(*length), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
-		return nil, fmt.Errorf("mmap file failed: %v\n", err)
+		return nil, fmt.Errorf("mmap file failed: %v", err)
 	}
 	fmt.Printf("mmap file success: addr %x size %d\n", uintptr(unsafe.Pointer(&addr[0])), *length)
 	return addr, nil
@@ -98,12 +97,12 @@ func do_register(ctx context.Context, store *p2pstore.P2PStore, fileName string,
 		sizeList[0]>>20)
 
 	startTimestamp := time.Now()
-	const MAX_SHARD_SIZE uint64 = 64 * 1024 * 1024
+	const MAX_SHARD_SIZE uint64 = 128 * 1024 * 1024
 	const MEMORY_LOCATION string = "cpu:0"
 
 	err := store.Register(ctx, fileName, addrList, sizeList, MAX_SHARD_SIZE, MEMORY_LOCATION, true)
 	if err != nil {
-		return fmt.Errorf("registration failed: %v\n", err)
+		return fmt.Errorf("registration failed: %v", err)
 	}
 
 	phaseOneTimestamp := time.Now()
@@ -132,7 +131,7 @@ func (a *AgentServer) do_register_block(ctx context.Context, block *BlockInfo, i
 	if block.fileAddr == 0 {
 		addr, err := mmapFileSection(block.fileName, offset, &size)
 		if err != nil {
-			return fmt.Errorf("mmap file failed: %v\n", err)
+			return fmt.Errorf("mmap file failed: %v", err)
 		}
 		blockAddr = uintptr(unsafe.Pointer(&addr[0]))
 	} else {
@@ -150,7 +149,7 @@ func (a *AgentServer) register(ctx context.Context, fileName string) error {
 	var fileSize uint64 = 0
 	addr, err := mmapFileSection(fileName, 0, &fileSize)
 	if err != nil {
-		return fmt.Errorf("mmap file failed: %v\n", err)
+		return fmt.Errorf("mmap file failed: %v", err)
 	}
 
 	fileAddr := uintptr(unsafe.Pointer(&addr[0]))
@@ -161,37 +160,31 @@ func (a *AgentServer) register(ctx context.Context, fileName string) error {
 		return err
 	}
 
-	if !strings.Contains(fileName, ":") {
-		blockInfo := NewBlockInfo(fileName, fileSize)
-		blockInfo.fileAddr = fileAddr
-		if err := a.do_register_block(ctx, blockInfo, 0); err != nil {
-			return err
-		}
-	}
+	// if !strings.Contains(fileName, ":") {
+	// 	blockInfo := NewBlockInfo(fileName, fileSize)
+	// 	blockInfo.fileAddr = fileAddr
+	// 	if err := a.do_register_block(ctx, blockInfo, 0); err != nil {
+	// 		return err
+	// 	}
+	// }
 
-	checkpointInfoList, err := store.List(ctx, "/")
-	if err != nil {
-		return fmt.Errorf("List failed: %v\n", err)
-	}
+	// checkpointInfoList, err := store.List(ctx, "/")
+	// if err != nil {
+	// 	return fmt.Errorf("List failed: %v", err)
+	// }
+	// fmt.Println(checkpointInfoList)
 
-	fmt.Println(checkpointInfoList)
 	return nil
 }
 
-func (a *AgentServer) getFile(ctx context.Context, fileName string) error {
-	store := a.p2pStore
-	fileMeta, err := store.Get(ctx, fileName)
-	if err != nil {
-		return fmt.Errorf("get metadata failed: %v\n", err)
-	}
-	var fileSize = fileMeta.Size
+func prepareFile(fileName string, fileSize uint64) (*os.File, error) {
 	dirPath := filepath.Dir(fileName)
-	_, err = os.Stat(dirPath)
+	_, err := os.Stat(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("dir not exist: ", dirPath)
+			return nil, fmt.Errorf("dir not exist: ", dirPath)
 		}
-		return fmt.Errorf("stat dir failed: %v\n", err)
+		return nil, fmt.Errorf("stat dir failed: %v", err)
 	}
 	_, err = os.Stat(fileName)
 	if err == nil {
@@ -199,25 +192,39 @@ func (a *AgentServer) getFile(ctx context.Context, fileName string) error {
 	}
 	f, err := os.Create(fileName)
 	if err != nil {
-		return fmt.Errorf("create file failed: %v\n", err)
+		return nil, fmt.Errorf("create file failed: %v", err)
 	}
 	if err := f.Truncate(int64(fileSize)); err != nil {
-		return fmt.Errorf("truncate file failed: %v\n", err)
+		return nil, fmt.Errorf("truncate file failed: %v", err)
+	}
+	return f, nil
+}
+
+func (a *AgentServer) getFile(ctx context.Context, registerName string, localName string) error {
+	store := a.p2pStore
+	fileMeta, err := store.Get(ctx, registerName)
+	if err != nil {
+		return fmt.Errorf("get metadata failed: %v", err)
+	}
+	var fileSize = fileMeta.Size
+	f, err := prepareFile(localName, fileSize)
+	if err != nil {
+		return fmt.Errorf("prepare file failed: %v", err)
 	}
 	defer f.Close()
 
-	addr, err := mmapFileSection(fileName, 0, &fileSize)
+	addr, err := mmapFileSection(localName, 0, &fileSize)
 	if err != nil {
-		return fmt.Errorf("mmap file failed: %v\n", err)
+		return fmt.Errorf("mmap file failed: %v", err)
 	}
 
-	fmt.Println("Object retrieval started: name", fileName)
+	fmt.Fprintf(os.Stdout, "Object retrieval started: %s -> %s\n", registerName, localName)
 	startTimestamp := time.Now()
 	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
 	sizeList := []uint64{fileSize}
-	err = store.GetReplica(ctx, fileName, addrList, sizeList)
+	err = store.GetReplica(ctx, registerName, addrList, sizeList)
 	if err != nil {
-		return fmt.Errorf("Object retrieval failed: %v\n", err)
+		return fmt.Errorf("Object retrieval failed: %v", err)
 	}
 
 	phaseOneTimestamp := time.Now()
@@ -239,28 +246,32 @@ func (a *AgentServer) getFile(ctx context.Context, fileName string) error {
 	// 	return fmt.Errorf("DeleteReplica failed: %v\n")
 	// }
 
-	if err := syscall.Munmap(addr); err != nil {
-		return fmt.Errorf("unmap failed: %v\n")
-	}
+	// if err := syscall.Munmap(addr); err != nil {
+	// 	return fmt.Errorf("unmap failed: %v\n")
+	// }
 
-	if strings.Contains(fileName, ":") {
-		return nil
-	}
+	// if strings.Contains(fileName, ":") {
+	// 	return nil
+	// }
 
-	blockInfo := NewBlockInfo(fileName, fileSize)
-	if err = a.do_register_block(ctx, blockInfo, 1); err != nil {
-		return fmt.Errorf("register block failed in getFile: %v\n", err)
-	}
+	// blockInfo := NewBlockInfo(fileName, fileSize)
+	// if err = a.do_register_block(ctx, blockInfo, 1); err != nil {
+	// 	return fmt.Errorf("register block failed in getFile: %v\n", err)
+	// }
 	return nil
 }
 
-func (a *AgentServer) do_unregister(ctx context.Context, fileName string) error {
+func (a *AgentServer) unregister(ctx context.Context, fileName string) error {
 	store := a.p2pStore
 	err := store.Unregister(ctx, fileName)
 	if err != nil {
-		return fmt.Errorf("unregister failed: %v\n", err)
+		return fmt.Errorf("unregister failed: %v", err)
 	}
 	fmt.Println("Object unregistration done name: ", fileName)
+	return nil
+}
+
+func (a *AgentServer) deleteFile(ctx context.Context, fileName string) error {
 	return nil
 }
 
@@ -279,31 +290,44 @@ func (a *AgentServer) ServeReq(w http.ResponseWriter, r *http.Request) {
 
 	cmd := payload.Command
 	fileName := payload.FileName
-	log.Println("(whorwe)GetReq: 0 | cmd:", cmd, ", fileName:", fileName)
+	localName := fileName
+	if payload.LocalName != "" {
+		localName = payload.LocalName
+	}
+	fmt.Fprintf(os.Stdout, "Got Request cmd: %s, fileName: %s\n", cmd, fileName)
 	switch cmd {
 	case "register":
 		err := a.register(context.Background(), fileName)
 		if err != nil {
-			log.Println("register failed: ", err)
+			err_msg := fmt.Sprintf("register failed: %s", err)
+			fmt.Fprintf(os.Stderr, err_msg+"\n")
+			http.Error(w, err_msg, http.StatusInternalServerError)
 		}
 	case "get":
-		err := a.getFile(context.Background(), fileName)
+		err := a.getFile(context.Background(), fileName, localName)
 		if err != nil {
-			log.Println("get failed: ", err)
+			err_msg := fmt.Sprintf("get failed: %s", err)
+			fmt.Fprintf(os.Stderr, err_msg+"\n")
+			http.Error(w, err_msg, http.StatusInternalServerError)
 		}
 	case "unregister":
-		err := a.do_unregister(context.Background(), fileName)
+		err := a.unregister(context.Background(), fileName)
 		if err != nil {
-			log.Println("unregister failed: ", err)
+			err_msg := fmt.Sprintf("unregister failed: %s", err)
+			fmt.Fprintf(os.Stderr, err_msg+"\n")
+			http.Error(w, err_msg, http.StatusInternalServerError)
 		}
 	case "list":
 		fileList, err := a.p2pStore.List(context.Background(), "/")
 		if err != nil {
-			log.Println("list failed: ", err)
+			err_msg := fmt.Sprintf("list failed: %s", err)
+			fmt.Fprintf(os.Stderr, err_msg+"\n")
+			http.Error(w, err_msg, http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(fileList)
 	default:
-		log.Println("unknown command: ", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 	}
 }
