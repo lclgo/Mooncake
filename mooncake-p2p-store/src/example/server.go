@@ -31,11 +31,12 @@ type AgentServer struct {
 }
 
 type BlockInfo struct {
-	blockNum  int
-	blockSize uint64
-	fileSize  uint64
-	fileAddr  uintptr
-	fileName  string
+	blockNum     int
+	blockSize    uint64
+	fileSize     uint64
+	fileAddr     uintptr
+	registerName string
+	localName    string
 }
 
 type MapInfo struct {
@@ -75,11 +76,11 @@ func NewBlockInfo(fileName string, fileSize uint64) *BlockInfo {
 	alignMB := uint64(1)<<uint64(20) - uint64(1)
 	blockSize := (fileSize/uint64(blockNum) + alignMB) & ^alignMB
 	return &BlockInfo{
-		blockNum:  blockNum,
-		blockSize: blockSize,
-		fileSize:  fileSize,
-		fileAddr:  0,
-		fileName:  fileName,
+		blockNum:     blockNum,
+		blockSize:    blockSize,
+		fileSize:     fileSize,
+		fileAddr:     0,
+		registerName: fileName,
 	}
 }
 
@@ -120,10 +121,10 @@ func mmapFileSection(path string, offset uint64, length *uint64) ([]byte, error)
 }
 
 func do_register(ctx context.Context, store *p2pstore.P2PStore, fileName string, addrList []uintptr, sizeList []uint64) error {
-	fmt.Printf("Object registration: name %s base address %x file size %d MB\n",
+	fmt.Printf("Object registration: name %s base address %x file size %d\n",
 		fileName,
 		addrList[0],
-		sizeList[0]>>20)
+		sizeList[0])
 
 	startTimestamp := time.Now()
 	const MAX_SHARD_SIZE uint64 = 128 * 1024 * 1024
@@ -159,7 +160,7 @@ func (a *AgentServer) do_register_block(ctx context.Context, block *BlockInfo, i
 	var blockAddr uintptr
 	// if blockAddr == 0, means this file is not mapped
 	if block.fileAddr == 0 {
-		addr, err := mmapFileSection(block.fileName, offset, &size)
+		addr, err := mmapFileSection(block.localName, offset, &size)
 		if err != nil {
 			return fmt.Errorf("mmap file failed: %v", err)
 		}
@@ -168,7 +169,7 @@ func (a *AgentServer) do_register_block(ctx context.Context, block *BlockInfo, i
 		blockAddr = block.fileAddr + uintptr(offset)
 	}
 
-	blockName := fmt.Sprintf("%s:%d:%d", block.fileName, id, block.blockNum)
+	blockName := fmt.Sprintf("%s:%d:%d", block.registerName, id, block.blockNum)
 	addrList := []uintptr{blockAddr}
 	sizeList := []uint64{size}
 	return do_register(ctx, a.p2pStore, blockName, addrList, sizeList)
@@ -192,7 +193,8 @@ func (a *AgentServer) register(ctx context.Context, fileName string) error {
 
 	if a.agentID == 0 && !strings.Contains(fileName, ":") {
 		blockInfo := NewBlockInfo(fileName, fileSize)
-		blockInfo.fileAddr = fileAddr
+		blockInfo.localName = fileName
+		// blockInfo.fileAddr = fileAddr
 		if err := a.do_register_block(ctx, blockInfo, a.agentID); err != nil {
 			return err
 		}
@@ -254,7 +256,23 @@ func copyFromLocal(registerName string, fileSize uint64, dstSlice []byte) error 
 	return nil
 }
 
-func (a *AgentServer) getFile(ctx context.Context, registerName string, localName string) error {
+func getReplicaToMem(ctx context.Context, store *p2pstore.P2PStore, registerName string, addr []byte, size uint64) error {
+	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
+	sizeList := []uint64{size}
+	err := store.GetReplica(ctx, registerName, addrList, sizeList)
+	if err != nil && err != p2pstore.ErrPayloadOpened {
+		return fmt.Errorf("Object retrieval failed: %v", err)
+	}
+
+	if err == p2pstore.ErrPayloadOpened {
+		copyFromLocal(registerName, size, addr)
+	} else {
+		updateMap(registerName, addrList, sizeList)
+	}
+	return nil
+}
+
+func (a *AgentServer) doGetFullFile(ctx context.Context, registerName string, localName string) error {
 	store := a.p2pStore
 	fileMeta, err := store.Get(ctx, registerName)
 	if err != nil {
@@ -273,26 +291,7 @@ func (a *AgentServer) getFile(ctx context.Context, registerName string, localNam
 	}
 
 	fmt.Fprintf(os.Stdout, "Object retrieval started: %s -> %s\n", registerName, localName)
-	startTimestamp := time.Now()
-	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
-	sizeList := []uint64{fileSize}
-	err = store.GetReplica(ctx, registerName, addrList, sizeList)
-	if err != nil && err != p2pstore.ErrPayloadOpened {
-		return fmt.Errorf("Object retrieval failed: %v", err)
-	}
-
-	if err == p2pstore.ErrPayloadOpened {
-		copyFromLocal(registerName, fileSize, addr)
-	} else {
-		updateMap(registerName, addrList, sizeList)
-	}
-
-	phaseOneTimestamp := time.Now()
-	duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
-
-	fmt.Printf("Object retrieval done: duration (ms) %d throughput (GB/s) %.2f\n",
-		duration,
-		float64(fileSize>>20)/float64(duration))
+	getReplicaToMem(ctx, store, registerName, addr, fileSize)
 
 	// 这里不要DeleteReplica，不然node1 register bar，node2 get bar + register bar:1:2后
 	// node1 get bar:1:2会失败。
@@ -310,13 +309,58 @@ func (a *AgentServer) getFile(ctx context.Context, registerName string, localNam
 	// 	return fmt.Errorf("unmap failed: %v\n")
 	// }
 
-	if a.agentID != 0 && a.agentID < blockNum && !strings.Contains(registerName, ":") {
+	if a.agentID > 0 && a.agentID < blockNum && !strings.Contains(registerName, ":") {
 		blockInfo := NewBlockInfo(registerName, fileSize)
-		blockInfo.fileAddr = uintptr(unsafe.Pointer(&addr[0]))
+		blockInfo.localName = localName
+		// blockInfo.fileAddr = uintptr(unsafe.Pointer(&addr[0]))
 		if err := a.do_register_block(ctx, blockInfo, a.agentID); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+func (a *AgentServer) getFile(ctx context.Context, registerName string, localName string) error {
+	startTimestamp := time.Now()
+	store := a.p2pStore
+	fileMeta, err := store.Get(ctx, registerName)
+	if err != nil {
+		return fmt.Errorf("Get file meta failed: %v", err)
+	}
+	var fileSize = fileMeta.Size
+	defer func() {
+		phaseOneTimestamp := time.Now()
+		duration := phaseOneTimestamp.Sub(startTimestamp).Milliseconds()
+
+		fmt.Printf("Object retrieval done: duration (ms) %d throughput (GB/s) %.2f\n",
+			duration,
+			float64(fileSize>>20)/float64(duration))
+	}()
+
+	for i := 0; i < blockNum; i++ {
+		_, err := store.Get(ctx, fmt.Sprintf("%s:%d:%d", registerName, i, blockNum))
+		if err != nil {
+			return a.doGetFullFile(ctx, registerName, localName)
+		}
+	}
+
+	fmt.Fprintf(os.Stdout, "Object retrieval started (block mode): %s -> %s\n", registerName, localName)
+	prepareFile(localName, fileSize)
+	block := NewBlockInfo(registerName, fileSize)
+	for i := uint64(0); i < blockNum; i++ {
+		offset := i * block.blockSize
+		size := block.blockSize
+		if offset+size > block.fileSize {
+			size = block.fileSize - offset
+		}
+		addr, err := mmapFileSection(localName, offset, &size)
+		if err != nil {
+			return fmt.Errorf("mmap file failed: %v", err)
+		}
+		blockRegisterName := fmt.Sprintf("%s:%d:%d", registerName, i, blockNum)
+		getReplicaToMem(ctx, store, blockRegisterName, addr, size)
+	}
+
 	return nil
 }
 

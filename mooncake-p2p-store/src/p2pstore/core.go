@@ -137,7 +137,8 @@ func (store *P2PStore) Register(ctx context.Context,
 		addr, size := addrList[i], sizeList[i]
 		payload.Size += size
 		err := store.memory.Add(addr, size, maxShardSize, location)
-		if err != nil && err != ErrAddressOverlapped {
+		if err != nil {
+			// if err != nil && err != ErrAddressOverlapped {
 			store.unregisterBuffers(bufferList, maxShardSize)
 			return err
 		}

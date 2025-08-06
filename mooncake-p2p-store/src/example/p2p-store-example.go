@@ -38,6 +38,7 @@ var (
 	nicPriorityMatrixPath string
 	fileSize              int
 	fileSizeMB            int
+	enableBlockDownload   bool
 )
 
 var agentID int
@@ -116,6 +117,7 @@ func main() {
 	flag.StringVar(&deviceName, "device_name", "mlx5_2", "RNIC device name")
 	flag.StringVar(&nicPriorityMatrixPath, "nic_priority_matrix", "", "Path to NIC priority matrix file (Advanced)")
 	flag.IntVar(&fileSizeMB, "file_size_mb", 2048, "File size in MB")
+	flag.BoolVar(&enableBlockDownload, "block_download", false, "Enable block download")
 	flag.Parse()
 
 	fileSize = fileSizeMB * 1024 * 1024
@@ -129,13 +131,17 @@ func main() {
 		}
 	}
 
-	agentID := getID(metadataServer, "/agents/seq")
-	if agentID < 0 {
-		fmt.Fprintf(os.Stderr, "agent ID is invalid\n")
-		os.Exit(1)
+	if enableBlockDownload {
+		agentID = getID(metadataServer, "/agents/seq")
+		if agentID < 0 {
+			fmt.Fprintf(os.Stderr, "agent ID is invalid\n")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Agent ID: %d\n", agentID)
+	} else {
+		agentID = -1
 	}
 
-	fmt.Fprintf(os.Stderr, "Agent ID: %d\n", agentID)
 	agentServer := NewAgentServer()
 	agentServer.agentID = agentID
 	agentServer.metaServer = metadataServer
