@@ -37,6 +37,33 @@ type BlockInfo struct {
 	fileName  string
 }
 
+type MapInfo struct {
+	addrList []uintptr
+	sizeList []uint64
+}
+
+var fileMappings = make(map[string]*MapInfo)
+
+func updateMap(registerName string, addrList []uintptr, sizeList []uint64) {
+	fileMappings[registerName] = &MapInfo{
+		addrList: addrList,
+		sizeList: sizeList,
+	}
+}
+
+func deleteMap(registerName string) error {
+	delete(fileMappings, registerName)
+	return nil
+}
+
+func getMap(registerName string) *MapInfo {
+	if info, ok := fileMappings[registerName]; ok {
+		return info
+	} else {
+		return nil
+	}
+}
+
 func NewAgentServer() *AgentServer {
 	return &AgentServer{}
 }
@@ -159,6 +186,7 @@ func (a *AgentServer) register(ctx context.Context, fileName string) error {
 		[]uint64{fileSize}); err != nil {
 		return err
 	}
+	updateMap(fileName, []uintptr{fileAddr}, []uint64{fileSize})
 
 	// if !strings.Contains(fileName, ":") {
 	// 	blockInfo := NewBlockInfo(fileName, fileSize)
@@ -200,6 +228,30 @@ func prepareFile(fileName string, fileSize uint64) (*os.File, error) {
 	return f, nil
 }
 
+func copyFromLocal(registerName string, fileSize uint64, dstSlice []byte) error {
+	mapInfo := getMap(registerName)
+	if mapInfo.sizeList[0] != fileSize {
+		return fmt.Errorf("file size mismatch: %d vs %d", mapInfo.sizeList[0], fileSize)
+	}
+	copyChunk := uint64(512 << 20) // 512M
+	srcSlice := unsafe.Slice((*byte)(unsafe.Pointer(mapInfo.addrList[0])), fileSize)
+	fmt.Fprintf(os.Stdout, "Copy payload from local, src: %x, dst: %x\n",
+		mapInfo.addrList[0],
+		uintptr(unsafe.Pointer(&dstSlice[0])))
+	for i := uint64(0); i < fileSize; i += copyChunk {
+		copySize := copyChunk
+		if i+copyChunk > fileSize {
+			copySize = fileSize - i
+		}
+		copy(dstSlice[i:i+copySize], srcSlice[i:i+copySize])
+		// fmt.Fprintf(os.Stdout, "copy chunk: %d, fileSize: %d, copySize: %dM\n", i, fileSize, copySize>>20)
+	}
+	if err := syscall.Munmap(dstSlice); err != nil {
+		return fmt.Errorf("unmap failed: %v", err)
+	}
+	return nil
+}
+
 func (a *AgentServer) getFile(ctx context.Context, registerName string, localName string) error {
 	store := a.p2pStore
 	fileMeta, err := store.Get(ctx, registerName)
@@ -223,8 +275,14 @@ func (a *AgentServer) getFile(ctx context.Context, registerName string, localNam
 	addrList := []uintptr{uintptr(unsafe.Pointer(&addr[0]))}
 	sizeList := []uint64{fileSize}
 	err = store.GetReplica(ctx, registerName, addrList, sizeList)
-	if err != nil {
+	if err != nil && err != p2pstore.ErrPayloadOpened {
 		return fmt.Errorf("Object retrieval failed: %v", err)
+	}
+
+	if err == p2pstore.ErrPayloadOpened {
+		copyFromLocal(registerName, fileSize, addr)
+	} else {
+		updateMap(registerName, addrList, sizeList)
 	}
 
 	phaseOneTimestamp := time.Now()
@@ -267,6 +325,15 @@ func (a *AgentServer) unregister(ctx context.Context, fileName string) error {
 	if err != nil {
 		return fmt.Errorf("unregister failed: %v", err)
 	}
+	mapInfo := getMap(fileName)
+	if mapInfo == nil {
+		return fmt.Errorf("cannot find mapInfo: %s", fileName)
+	}
+	unmapAddr := unsafe.Slice((*byte)(unsafe.Pointer(mapInfo.addrList[0])), mapInfo.sizeList[0])
+	if err := syscall.Munmap(unmapAddr); err != nil {
+		return fmt.Errorf("unmap failed: %v\n", err)
+	}
+	deleteMap(fileName)
 	fmt.Println("Object unregistration done name: ", fileName)
 	return nil
 }
