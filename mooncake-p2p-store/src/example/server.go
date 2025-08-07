@@ -158,6 +158,7 @@ func (a *AgentServer) do_register_block(ctx context.Context, block *BlockInfo, i
 	}
 
 	var blockAddr uintptr
+	var addr []byte
 	// if blockAddr == 0, means this file is not mapped
 	if block.fileAddr == 0 {
 		addr, err := mmapFileSection(block.localName, offset, &size)
@@ -166,13 +167,23 @@ func (a *AgentServer) do_register_block(ctx context.Context, block *BlockInfo, i
 		}
 		blockAddr = uintptr(unsafe.Pointer(&addr[0]))
 	} else {
+		// shouldn't go to this branch, we now always create a
+		// new map area for block.
 		blockAddr = block.fileAddr + uintptr(offset)
 	}
 
 	blockName := fmt.Sprintf("%s:%d:%d", block.registerName, id, block.blockNum)
 	addrList := []uintptr{blockAddr}
 	sizeList := []uint64{size}
-	return do_register(ctx, a.p2pStore, blockName, addrList, sizeList)
+	err := do_register(ctx, a.p2pStore, blockName, addrList, sizeList)
+	// NOTE: block.fileAddr is always 0, because we now always create
+	// a new map area for block
+	if err != nil && block.fileAddr == 0 {
+		if syscall.Munmap(addr); err != nil {
+			return fmt.Errorf("munmap file failed: %v", err)
+		}
+	}
+	return err
 }
 
 func (a *AgentServer) register(ctx context.Context, fileName string) error {
@@ -188,6 +199,9 @@ func (a *AgentServer) register(ctx context.Context, fileName string) error {
 	if err := do_register(ctx, store, fileName,
 		[]uintptr{fileAddr},
 		[]uint64{fileSize}); err != nil {
+		if syscall.Munmap(addr); err != nil {
+			return fmt.Errorf("munmap file failed: %v", err)
+		}
 		return err
 	}
 
